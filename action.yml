@@ -19,6 +19,14 @@ inputs:
     description: 'Directory to scan from (relative to the repo root).'
     required: false
     default: '.'
+  comment:
+    description: 'Post/update a findings comment on the pull request. Requires `permissions: pull-requests: write` in the calling workflow.'
+    required: false
+    default: 'false'
+  github-token:
+    description: 'Token used to post the PR comment. Defaults to the workflow token.'
+    required: false
+    default: ${{ github.token }}
 
 outputs:
   max-score:
@@ -39,14 +47,16 @@ runs:
   steps:
     - id: scan
       shell: bash
+      env:
+        MCPSHIELD_GITHUB_TOKEN: ${{ inputs.github-token }}
       run: |
         PY="$(command -v python3 || command -v python || true)"
         if [ -z "$PY" ]; then
           echo "::error::Python 3 is required to run the MCPShield scan but was not found on this runner."
           exit 1
         fi
-        "$PY" "$GITHUB_ACTION_PATH/mcp_scan.py" \
-          --paths "${{ inputs.paths }}" \
-          --fail-on "${{ inputs.fail-on }}" \
-          --working-directory "${{ inputs.working-directory }}" \
-          --github
+        ARGS=(--paths "${{ inputs.paths }}" --fail-on "${{ inputs.fail-on }}" --working-directory "${{ inputs.working-directory }}" --github)
+        if [ "${{ inputs.comment }}" = "true" ]; then
+          ARGS+=(--comment)
+        fi
+        "$PY" "$GITHUB_ACTION_PATH/mcp_scan.py" "${ARGS[@]}"

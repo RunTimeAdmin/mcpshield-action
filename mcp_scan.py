@@ -24,6 +24,8 @@ import json
 import os
 import re
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -454,6 +456,93 @@ def _write_github_output(rows: list[dict[str, Any]]) -> None:
     return summary
 
 
+# ---------------------------------------------------------------------------
+# PR comment (opt-in) — one sticky comment, stdlib urllib only (keeps zero deps)
+# ---------------------------------------------------------------------------
+
+_COMMENT_MARKER = "<!-- mcpshield-scan -->"
+
+
+def _gh_api(method: str, url: str, token: str, data: dict[str, Any] | None = None) -> Any:
+    body = json.dumps(data).encode("utf-8") if data is not None else None
+    req = urllib.request.Request(url, data=body, method=method)
+    req.add_header("Authorization", f"Bearer {token}")
+    req.add_header("Accept", "application/vnd.github+json")
+    req.add_header("X-GitHub-Api-Version", "2022-11-28")
+    req.add_header("User-Agent", "mcpshield-action")
+    if body is not None:
+        req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        raw = resp.read()
+    return json.loads(raw.decode("utf-8")) if raw else None
+
+
+def _pr_number() -> int | None:
+    path = os.environ.get("GITHUB_EVENT_PATH")
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            event = json.load(fh)
+    except Exception:  # noqa: BLE001
+        return None
+    pr = event.get("pull_request")
+    if isinstance(pr, dict) and isinstance(pr.get("number"), int):
+        return pr["number"]
+    return None
+
+
+def _find_sticky_comment(api: str, repo: str, pr: int, token: str) -> int | None:
+    for page in range(1, 11):  # scan up to 1000 comments for our marker
+        comments = _gh_api(
+            "GET", f"{api}/repos/{repo}/issues/{pr}/comments?per_page=100&page={page}", token
+        )
+        if not comments:
+            return None
+        for c in comments:
+            if _COMMENT_MARKER in (c.get("body") or ""):
+                return c.get("id")
+        if len(comments) < 100:
+            return None
+    return None
+
+
+def post_pr_comment(summary_md: str) -> None:
+    """Post or update a single sticky findings comment on the PR. Best-effort:
+    a comment failure logs a warning but never fails the build."""
+    token = os.environ.get("MCPSHIELD_GITHUB_TOKEN", "").strip()
+    if not token:
+        print("::warning::comment mode is on but no github-token was provided; skipping PR comment.")
+        return
+    pr = _pr_number()
+    if pr is None:
+        print("comment: not a pull_request event; skipping PR comment.")
+        return
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    api = os.environ.get("GITHUB_API_URL", "https://api.github.com")
+    if not repo:
+        print("::warning::GITHUB_REPOSITORY is unset; skipping PR comment.")
+        return
+    body = f"{_COMMENT_MARKER}\n{summary_md}"
+    try:
+        existing = _find_sticky_comment(api, repo, pr, token)
+        if existing is not None:
+            _gh_api("PATCH", f"{api}/repos/{repo}/issues/comments/{existing}", token, {"body": body})
+            print(f"comment: updated sticky comment #{existing} on PR #{pr}.")
+        else:
+            _gh_api("POST", f"{api}/repos/{repo}/issues/{pr}/comments", token, {"body": body})
+            print(f"comment: posted findings comment on PR #{pr}.")
+    except urllib.error.HTTPError as exc:
+        hint = (
+            " — needs `permissions: pull-requests: write`; note fork PRs get a read-only token"
+            if exc.code in (403, 404)
+            else ""
+        )
+        print(f"::warning::comment: GitHub API returned HTTP {exc.code}{hint}; skipping.")
+    except Exception as exc:  # noqa: BLE001
+        print(f"::warning::comment: failed to post PR comment: {exc}")
+
+
 def run_scan(args: argparse.Namespace) -> int:
     root = Path(args.working_directory or ".")
     patterns = [p.strip() for p in re.split(r"[,\n]", args.paths or "") if p.strip()]
@@ -467,6 +556,8 @@ def run_scan(args: argparse.Namespace) -> int:
         if summary_path:
             with open(summary_path, "a", encoding="utf-8") as fh:
                 fh.write(summary_md)
+    if args.comment:
+        post_pr_comment(summary_md)
     print(summary_md)
 
     if args.fail_on == "never":
@@ -530,6 +621,11 @@ def main() -> int:
     )
     parser.add_argument("--working-directory", default=".")
     parser.add_argument("--github", action="store_true", help="emit annotations + job summary")
+    parser.add_argument(
+        "--comment",
+        action="store_true",
+        help="post/update a sticky findings comment on the PR (reads MCPSHIELD_GITHUB_TOKEN)",
+    )
     parser.add_argument("--self-test", metavar="FIXTURES", help="run parity check and exit")
     args = parser.parse_args()
 

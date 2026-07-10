@@ -39,3 +39,18 @@ jobs:
           paths: examples/sample-mcp.json
           fail-on: never
       - run: test "${{ steps.scan.outputs.max-level }}" = "high"
+
+  # Exercise PR-comment mode end-to-end (posts a sticky comment on the PR).
+  pr-comment:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./
+        with:
+          paths: examples/sample-mcp.json
+          fail-on: never
+          comment: true

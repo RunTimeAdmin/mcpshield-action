@@ -43,6 +43,29 @@ With no `paths`, it auto-discovers common MCP config filenames across the repo
           fail-on: critical
 ```
 
+### Comment on the pull request
+
+Post the findings table as a sticky comment on the PR (updated in place on each
+run, never duplicated). Requires `pull-requests: write` permission:
+
+```yaml
+jobs:
+  mcp-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: RunTimeAdmin/mcpshield-action@v1
+        with:
+          fail-on: high
+          comment: true
+```
+
+> Pull requests from forks get a read-only token, so GitHub blocks comments on
+> them. The scan still runs and the job summary is always posted.
+
 ## Inputs
 
 | Input | Default | Description |
@@ -50,6 +73,8 @@ With no `paths`, it auto-discovers common MCP config filenames across the repo
 | `paths` | *(auto-discover)* | Comma/newline-separated globs of config files to scan. |
 | `fail-on` | `high` | Fail the job if any server is at or above this level, or `never` to report only. |
 | `working-directory` | `.` | Directory to scan from. |
+| `comment` | `false` | Post/update a sticky findings comment on the PR. Needs `pull-requests: write`. |
+| `github-token` | workflow token | Token used to post the PR comment. |
 
 ## Outputs
 
