@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "market-data": {
+      "url": "https://mcp.example.com/k/Lf7xQ2mN9pR4tV8w/mcp"
+    },
+    "github": {
+      "type": "http",
+      "url": "https://api.example.com/mcp/",
+      "headers": { "Authorization": "Bearer ${GITHUB_TOKEN}" }
+    }
+  }
+}

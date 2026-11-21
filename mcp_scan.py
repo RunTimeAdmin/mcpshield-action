@@ -69,11 +69,140 @@ _SECRET_PATTERNS = [
 ]
 
 
+# Credentials a remote MCP server carries in its URL or its request headers. A
+# remote (HTTP/SSE) server has no command line, so parse_config_text renders it
+# as `<url> --header "Name: value"` and it is scanned like one. A value found
+# here is reported as one of these two types.
+_URL_SECRET = "secret in server URL"
+_HEADER_SECRET = "secret in request header"
+_SECRET_LABELS = frozenset([label for _, label in _SECRET_PATTERNS] + [_URL_SECRET, _HEADER_SECRET])
+
+_REDACTED_RE = re.compile(r"\[REDACTED ([^\]]+)\]")
+_URL_RE = re.compile(r"(?:https?|wss?)://[^\s\"'<>]+", re.IGNORECASE)
+_HEADER_ARG_RE = re.compile(
+    r"(?:^|[^A-Za-z0-9_-])(?:--header|-H)(?:\s+|=)[\"']?([A-Za-z][A-Za-z0-9_-]*)[ \t]*:[ \t]*"
+    r"([^\"'\r\n]*?)(?=[\"']|\s+-{1,2}[A-Za-z]|\s*$)"
+)
+_CRED_HEADER_RE = re.compile(r"auth|key|token|secret|cookie|session|passw|credential", re.IGNORECASE)
+_CRED_PARAM_RE = re.compile(
+    r"(?:key|token|secret|passw(?:or)?d|pwd|auth|sig(?:nature)?|session|credentials?)$",
+    re.IGNORECASE,
+)
+_CRED_PATH_SEGMENTS = frozenset(
+    ["k", "key", "keys", "apikey", "api-key", "api_key", "token", "tokens", "secret", "secrets"]
+)
+_AUTH_SCHEME_RE = re.compile(r"(?:Bearer|Basic|Token|Bot|ApiKey|Key)\s+", re.IGNORECASE)
+_RANDOM_SEGMENT_RE = re.compile(r"[A-Za-z0-9_-]{20,}")
+_HEX_SEGMENT_RE = re.compile(r"[0-9A-Fa-f-]{32,}")
+# Not a secret: an env or template reference, a placeholder, or an earlier mask.
+_PLACEHOLDER_RE = re.compile(
+    r"\$\{[^}]*\}|\$[A-Za-z_][A-Za-z0-9_]*|\{\{[^}]*\}\}|<[^>]*>|%[A-Za-z_][A-Za-z0-9_]*%"
+    r"|\[REDACTED[^\]]*\]?|[xX*.]+|[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+"
+)
+
+
+def _is_placeholder(value: str) -> bool:
+    return bool(_PLACEHOLDER_RE.fullmatch(value)) or "your" in value.lower()
+
+
+def _looks_random(segment: str) -> bool:
+    """A path segment that reads as a generated key: long base62 with mixed case
+    and digits, or a long hex string or UUID."""
+    digits = len(re.findall(r"[0-9]", segment))
+    if (
+        _RANDOM_SEGMENT_RE.fullmatch(segment)
+        and digits
+        and re.search(r"[a-z]", segment)
+        and re.search(r"[A-Z]", segment)
+    ):
+        return True
+    return bool(_HEX_SEGMENT_RE.fullmatch(segment)) and digits >= 8
+
+
+def _url_secret_spans(url: str) -> list[tuple[int, int]]:
+    """Where in `url` a credential sits: a userinfo password, a key-named query
+    value, a path segment after a key-named one, or a segment that reads as a key."""
+    spans: list[tuple[int, int]] = []
+    scheme_end = url.index("://") + 3
+    authority_end = scheme_end + re.match(r"[^/?#]*", url[scheme_end:]).end()
+    authority = url[scheme_end:authority_end]
+    at = authority.rfind("@")
+    if at != -1:
+        colon = authority[:at].find(":")
+        if colon != -1:
+            password = authority[colon + 1:at]
+            if password and not _is_placeholder(password):
+                spans.append((scheme_end + colon + 1, scheme_end + at))
+    path_end = authority_end + re.match(r"[^?#]*", url[authority_end:]).end()
+    pos = authority_end
+    prev = ""
+    for segment in url[authority_end:path_end].split("/"):
+        after_key_name = (
+            prev.lower() in _CRED_PATH_SEGMENTS
+            and len(segment) >= 8
+            and re.search(r"[0-9]", segment)
+            and not _is_placeholder(segment)
+        )
+        if segment and (after_key_name or _looks_random(segment)):
+            spans.append((pos, pos + len(segment)))
+        prev = segment
+        pos += len(segment) + 1
+    if url[path_end:path_end + 1] == "?":
+        query_start = path_end + 1
+        query_end = query_start + re.match(r"[^#]*", url[query_start:]).end()
+        pos = query_start
+        for pair in url[query_start:query_end].split("&"):
+            eq = pair.find("=")
+            if eq > 0:
+                value = pair[eq + 1:]
+                if _CRED_PARAM_RE.search(pair[:eq]) and len(value) >= 8 and not _is_placeholder(value):
+                    spans.append((pos + eq + 1, pos + len(pair)))
+            pos += len(pair) + 1
+    return spans
+
+
+def _find_config_secrets(text: str) -> list[tuple[int, int, str]]:
+    """(start, end, type) of each credential value in a header argument or a URL
+    in `text`, in order and never overlapping."""
+    found: list[tuple[int, int, str]] = []
+    for m in _HEADER_ARG_RE.finditer(text):
+        if not _CRED_HEADER_RE.search(m.group(1)):
+            continue
+        start, end = m.start(2), m.end(2)
+        value = m.group(2)
+        scheme = _AUTH_SCHEME_RE.match(value)
+        if scheme:
+            start += scheme.end()
+            value = value[scheme.end():]
+        if len(value) >= 8 and not _is_placeholder(value):
+            found.append((start, end, _HEADER_SECRET))
+    for m in _URL_RE.finditer(text):
+        for s, e in _url_secret_spans(m.group(0)):
+            start, end = m.start() + s, m.start() + e
+            if not any(start < fe and fs < end for fs, fe, _ in found):
+                found.append((start, end, _URL_SECRET))
+    found.sort()
+    return found
+
+
+def _mask_patterns(text: str) -> str:
+    for pattern, label in _SECRET_PATTERNS:
+        text = pattern.sub(f"[REDACTED {label}]", text)
+    return text
+
+
 def _detect_secrets(text: str) -> list[str]:
-    """Distinct TYPES of hardcoded secrets found in `text` (never the values)."""
+    """Distinct TYPES of hardcoded secrets found in `text` (never the values).
+    A `[REDACTED <type>]` marker counts as its type, as in the canonical engine."""
     found: list[str] = []
     for pattern, label in _SECRET_PATTERNS:
         if label not in found and pattern.search(text):
+            found.append(label)
+    for m in _REDACTED_RE.finditer(text):
+        if m.group(1) in _SECRET_LABELS and m.group(1) not in found:
+            found.append(m.group(1))
+    for _, _, label in _find_config_secrets(_mask_patterns(text)):
+        if label not in found:
             found.append(label)
     return found
 
@@ -321,9 +450,34 @@ def _extract_scope(args: list[str]) -> str | None:
     if not args:
         return None
     last = args[-1]
+    # A header (`--header "Authorization: Bearer ..."`) is not a path.
+    if (len(args) > 1 and args[-2] in ("--header", "-H")) or last.startswith(("--header=", "-H=")):
+        return None
     if any(ch in last for ch in ("/", "\\", ":")):
         return last
     return None
+
+
+def _remote_url(raw: dict[str, Any]) -> str:
+    """A remote (HTTP/SSE) server's address: `url` in most clients, `serverUrl`
+    in Windsurf, `httpUrl` in Gemini CLI."""
+    for key in ("url", "serverUrl", "httpUrl"):
+        value = raw.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def _remote_command(url: str, headers: Any) -> str:
+    """Render a remote server as `<url> --header "Name: value"`, the way
+    mcp-remote takes it on a command line, so its URL and headers are scored
+    like a command."""
+    parts = [url]
+    if isinstance(headers, dict):
+        for name, value in headers.items():
+            if isinstance(value, str):
+                parts.append(f'--header "{name}: {value}"')
+    return " ".join(parts)
 
 
 def parse_config_text(text: str) -> list[dict[str, Any]]:
@@ -342,6 +496,18 @@ def parse_config_text(text: str) -> list[dict[str, Any]]:
         command = raw.get("command", "") if isinstance(raw.get("command"), str) else ""
         args = [str(a) for a in raw.get("args", [])] if isinstance(raw.get("args"), list) else []
         env = raw.get("env", {}) if isinstance(raw.get("env"), dict) else {}
+        url = "" if raw.get("command") else _remote_url(raw)
+        if url:
+            servers.append(
+                {
+                    "server_name": name,
+                    "server_type": "unknown",
+                    "command": _remote_command(url, raw.get("headers")),
+                    "scope": None,
+                    "env_vars": list(env.keys()),
+                }
+            )
+            continue
         full_command = f"{command} {' '.join(args)}" if args else command
         servers.append(
             {
