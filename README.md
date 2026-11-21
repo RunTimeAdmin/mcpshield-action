@@ -88,7 +88,8 @@ jobs:
 ## What it sees (and doesn't)
 
 This scores **config-level** signals: shell/exec server types, direct shell
-commands, sensitive filesystem scopes, and credential-shaped env var names. It
+commands, sensitive filesystem scopes, credential-shaped env var names, and
+hardcoded credentials, including a key in a remote server's URL or headers. It
 **cannot** see what a server's tools actually do — tool-description poisoning and
 CVE/KEV enrichment need a live connection to the running server. For that, run
 the free [MCPShield agent](https://mcpshield.app) with `--deep`. This action is

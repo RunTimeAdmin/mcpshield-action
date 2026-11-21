@@ -27,6 +27,19 @@ jobs:
           test "${{ steps.scan.outputs.max-level }}" = "high"
           test "${{ steps.scan.outputs.server-count }}" = "3"
 
+      - name: Dogfood a remote config (a key in a server URL)
+        id: remote
+        uses: ./
+        with:
+          paths: examples/remote-mcp.json
+          fail-on: never
+
+      - name: Assert the key in the URL was caught
+        run: |
+          echo "level=${{ steps.remote.outputs.max-level }} score=${{ steps.remote.outputs.max-score }} count=${{ steps.remote.outputs.server-count }}"
+          test "${{ steps.remote.outputs.max-level }}" = "medium"
+          test "${{ steps.remote.outputs.server-count }}" = "2"
+
   # Consume the published @v1 tag exactly as an external repo would, to prove the
   # Marketplace-referenced version resolves and runs (not just the local ./ path).
   consume-published:
